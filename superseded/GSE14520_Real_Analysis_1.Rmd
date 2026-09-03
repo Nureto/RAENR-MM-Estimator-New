@@ -1,0 +1,1010 @@
+---
+title: "RAENR-MM on GSE14520 — THCM and ICM Frameworks | Corrected Estimators"
+subtitle: "AFP Response | MM-RWAL eq (2.19-2.20) | RAENR-MM eq (2.22, 2.34-2.39)"
+author: "Alabi, Nurudeen Olawale & Oyeyemi, Gafar Matanmi"
+date: "`r Sys.Date()`"
+output:
+  word_document:
+    toc: true
+    number_sections: true
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    number_sections: true
+---
+
+```{r setup, include=TRUE}
+knitr::opts_chunk$set(echo=TRUE, message=FALSE, warning=FALSE,
+                      fig.width=10, fig.height=6, dpi=180, out.width="100%")
+```
+
+# Libraries
+
+```{r libraries}
+suppressPackageStartupMessages({
+  library(GEOquery);   library(Biobase)
+  library(glmnet);     library(robustbase)
+  library(future);     library(future.apply)   # fast parallel backend
+  library(dplyr);      library(tidyr)
+  library(ggplot2);    library(openxlsx)
+  library(knitr);      library(kableExtra)
+  library(scales);     library(matrixStats)
+})
+dir.create("figures", showWarnings = FALSE)
+```
+
+# Settings
+
+```{r settings, include = TRUE}
+set.seed(42L)
+options(stringsAsFactors = FALSE)
+RNGkind("Mersenne-Twister", "Inversion")
+
+P_GRID     <- c(1000L, 5000L, 10000L, 15000L, 20000L)
+n_reps     <- 1000L       # train/test replications per p level
+train_prop <- 0.80
+
+## Estimator tuning (thesis defaults)
+gamma_raen <- 2          # RAENR-MM adaptive weight exponent
+alpha_en   <- 0.5        # ENet mixing
+alpha_raen <- 0.2        # RAENR-MM mixing
+c_val      <- 4.685      # Tukey bisquare constant
+delta      <- 1e-6       # weight stabiliser
+
+## Speed controls
+NLAM      <- 20L         # nlambda for all cv.glmnet calls (fast but accurate)
+NFOLD     <- 3L          # nfolds
+MAX_IRLS  <- 5L          # outer IRLS iterations
+MAX_CD    <- 50L         # inner CD sweeps per IRLS step
+TOL_IRLS  <- 1e-3
+TOL_CD    <- 1e-4
+
+METHODS <- c("Ridge","LASSO","ENET","MM-RWAL","RAENR-MM")
+SPARSE  <- c("LASSO","ENET","MM-RWAL","RAENR-MM")
+COLS    <- c(Ridge="#16A085", LASSO="#27AE60", ENET="#2980B9",
+             `MM-RWAL`="#D35400", `RAENR-MM`="#21295C")
+```
+
+# Load GSE14520 and Build AFP Response
+
+```{r load_data, cache=TRUE, include = TRUE}
+gse_raw <- getGEO(
+  filename =
+    "GSE14520-GPL3921_series_matrix.txt.gz",
+  getGPL = FALSE
+)
+if (is(gse_raw,"ExpressionSet")) {
+  eset <- gse_raw
+} else {
+  np   <- sapply(gse_raw, function(x)
+            if (is(x,"ExpressionSet")) nrow(exprs(x)) else 0L)
+  eset <- gse_raw[[which.max(np)]]
+}
+expr_mat     <- exprs(eset)
+feature_info <- fData(eset)
+cat("Platform:", annotation(eset),
+    "| Probes:", nrow(expr_mat), "| Samples:", ncol(expr_mat), "\n")
+```
+
+```{r find_afp, cache=TRUE, include = TRUE}
+probe_ids <- function(fi)
+  if ("ID" %in% colnames(fi)) fi$ID else rownames(fi)
+safe_chr  <- function(x) {
+  if (is.list(x)) vapply(x, function(v) paste(unlist(v), collapse=" "),
+                         character(1))
+  else as.character(x)
+}
+search_col <- function(fi, col, pat) {
+  v <- tryCatch(safe_chr(fi[[col]]), error=function(e) character(0))
+  if (!length(v)) return(character(0))
+  probe_ids(fi)[grepl(pat, v, ignore.case=TRUE)]
+}
+
+afp_probes <- character(0)
+sym_col    <- c("Gene Symbol","Gene.Symbol","gene_assignment","symbol")[
+               c("Gene Symbol","Gene.Symbol","gene_assignment","symbol") %in%
+               colnames(feature_info)][1]
+if (!is.na(sym_col))
+  afp_probes <- search_col(feature_info, sym_col, "\\bAFP\\b")
+if (!length(afp_probes)) {
+  known <- c("208076_s_at","208075_s_at","208074_s_at","211368_s_at")
+  afp_probes <- known[known %in% rownames(expr_mat)]
+}
+if (!length(afp_probes)) stop("AFP probe not found.")
+valid <- afp_probes[afp_probes %in% rownames(expr_mat)]
+if (length(valid) > 1)
+  valid <- names(which.max(rowMeans(expr_mat[valid,,drop=FALSE])))
+
+response_row <- which(rownames(expr_mat) == valid)
+y_full       <- as.numeric(expr_mat[response_row, ])
+
+## Scaled predictor matrix (top max(P_GRID) variable genes)
+X_all  <- t(expr_mat[-response_row,]); X_all <- scale(X_all)
+cs     <- apply(X_all, 2, sd, na.rm=TRUE)
+X_all  <- X_all[, cs > 1e-8]
+gv     <- apply(X_all, 2, var, na.rm=TRUE)
+top_ix <- order(gv, decreasing=TRUE)[seq_len(max(P_GRID))]
+X_all  <- X_all[, top_ix]
+cat("AFP probe:", valid, "| n =", nrow(X_all),
+    "| SD(AFP) =", round(sd(y_full),3), "\n")
+```
+
+# Part A — Contamination and Multicollinearity Diagnostics
+
+```{r diagnostics, cache=TRUE, include = TRUE}
+run_diagnostics <- function(pp) {
+  Xp <- X_all[, seq_len(pp)]; n <- nrow(Xp); p <- ncol(Xp)
+
+  ## Multicollinearity
+  p_s   <- min(300L, p)
+  R_sub <- cor(Xp[, seq_len(p_s)])
+  ev    <- pmax(eigen(R_sub, symmetric=TRUE, only.values=TRUE)$values, 1e-12)
+  upper <- R_sub[upper.tri(R_sub)]
+  VIF_m <- if (p < n) {
+    Ri <- tryCatch(solve(cor(Xp)), error=function(e) NULL)
+    if (!is.null(Ri)) round(mean(diag(Ri)),2) else NA_real_
+  } else NA_real_
+
+  ## ICM: robust z-scores
+  cm   <- apply(Xp, 2, median, na.rm=TRUE)
+  csd  <- pmax(apply(Xp, 2, mad, na.rm=TRUE)*1.4826, 1e-8)
+  Z    <- sweep(sweep(Xp, 2, cm,"-"), 2, csd,"/")
+  om   <- abs(Z) > 3
+  rr   <- rowMeans(om)
+  icm_flagged_rows <- which(rr > 0.10)
+
+  ## THCM: robust Mahalanobis distance
+  n_pc <- min(30L, n-2L, p)
+  pca  <- prcomp(Xp, center=FALSE, scale.=FALSE, rank.=n_pc)
+  mcd  <- tryCatch(robustbase::covMcd(pca$x, alpha=0.75),
+                   error=function(e) NULL)
+  if (!is.null(mcd)) {
+    diff  <- sweep(pca$x, 2, mcd$center,"-")
+    Si    <- tryCatch(solve(mcd$cov), error=function(e) NULL)
+    rmd   <- if (!is.null(Si)) sqrt(pmax(diag(diff%*%Si%*%t(diff)),0))
+             else sqrt(rowSums(diff^2))
+    thr   <- sqrt(qchisq(0.975, df=n_pc))
+    thcm_flagged <- which(rmd > thr)
+    eps_thcm     <- round(mean(rmd > thr)*100, 3)
+    mean_rmd     <- round(mean(rmd), 3)
+  } else {
+    thcm_flagged <- integer(0)
+    eps_thcm <- NA_real_; mean_rmd <- NA_real_
+  }
+
+  list(
+    mc = data.frame(p=pp, n=n,
+      CN=round(max(ev)/min(ev),2),
+      MCI=round(sqrt(max(ev)/min(ev)),2),
+      Mean_AbsCorr=round(mean(abs(upper)),4),
+      Max_AbsCorr=round(max(abs(upper)),4),
+      Prop_EV_lt001=round(mean(ev<0.01),4),
+      Mean_VIF=VIF_m),
+    icm = data.frame(p=pp,
+      ICM_Pct=round(mean(om)*100,3),
+      Mean_Col_Pct=round(mean(colMeans(om))*100,3),
+      N_ICM_Rows=length(icm_flagged_rows),
+      Prop_HiContam_Rows=round(mean(rr>0.10)*100,3)),
+    thcm = data.frame(p=pp,
+      THCM_Pct=eps_thcm, N_Flagged=length(thcm_flagged),
+      Mean_RMD=mean_rmd),
+    thcm_flagged = thcm_flagged,
+    icm_z = Z
+  )
+}
+
+diag_list <- lapply(P_GRID, run_diagnostics)
+mc_df     <- dplyr::bind_rows(lapply(diag_list, `[[`, "mc"))
+icm_df    <- dplyr::bind_rows(lapply(diag_list, `[[`, "icm"))
+thcm_df   <- dplyr::bind_rows(lapply(diag_list, `[[`, "thcm"))
+```
+
+```{r diag_tables, echo=FALSE, include = TRUE}
+kable(mc_df, booktabs=TRUE, align="c", digits=4,
+      caption="Table 1: Multicollinearity Diagnostics — GSE14520") |>
+  kable_styling(bootstrap_options=c("striped","hover"), full_width=FALSE)
+kable(icm_df, booktabs=TRUE, align="c", digits=3,
+      caption="Table 2: ICM Diagnostics — GSE14520") |>
+  kable_styling(bootstrap_options=c("striped","hover"), full_width=FALSE)
+kable(thcm_df, booktabs=TRUE, align="c", digits=3,
+      caption="Table 3: THCM Diagnostics — GSE14520") |>
+  kable_styling(bootstrap_options=c("striped","hover"), full_width=FALSE)
+```
+
+# Part B — Estimator Functions
+
+## Safe coefficient extractor
+
+```{r safe_coef, include = TRUE}
+safe_coef_vec <- function(beta, p) {
+  if (is.null(beta) || length(beta)!=p || any(!is.finite(beta)))
+    return(rep(0, p))
+  as.vector(beta)
+}
+```
+
+## Soft-thresholding and Coordinate Descent — equations (2.37) and (2.34)–(2.38)
+
+```{r cd_helpers, include = TRUE}
+## Soft-thresholding — equation (2.37)
+## S(z, gamma) = sign(z) · max(|z| − gamma, 0)
+soft_threshold <- function(z, gamma) sign(z) * pmax(abs(z) - gamma, 0)
+
+## One full coordinate descent sweep — equations (2.34)–(2.38)
+##
+## At entry: beta is current coefficient vector
+##           Xw  = diag(sqrt(w_i^{(r)})) X    (observation-weighted X)
+##           yw  = sqrt(w_i^{(r)}) * y         (observation-weighted y)
+##           wp  = adaptive penalty weights w_j^{(a)}
+##           lam = fixed lambda
+##           alpha = elastic-net mixing parameter
+##
+## For each predictor j = 1, …, p:
+##   (2.34) r_{i,-j} = yw_i - sum_{k != j} Xw_ik * beta_k
+##   (2.35) z_j      = sum_i Xw_ij * r_{i,-j}
+##          d_j      = sum_i Xw_ij^2
+##   (2.36) denom    = d_j + lambda * (1 - alpha)
+##          beta_j  <- S( z_j / denom,  lambda * alpha * w_j^{(a)} / denom )
+##   (2.38) residuals updated in-place after beta_j changes
+cd_sweep <- function(Xw, yw, beta, wp, lam, alpha) {
+  p <- length(beta)
+  d <- colSums(Xw^2)                      # d_j = sum_i Xw_ij^2   -- eq (2.35)
+  r <- as.vector(yw - Xw %*% beta)        # initialise full residual
+
+  for (j in seq_len(p)) {
+
+    r   <- r + Xw[, j] * beta[j]          # eq (2.34): restore partial residual
+    z_j <- sum(Xw[, j] * r)               # eq (2.35): weighted partial corr
+
+    den     <- d[j] + lam * (1 - alpha)   # eq (2.36): denominator
+    beta[j] <- if (abs(den) < 1e-12) 0L else
+      soft_threshold(z_j / den,           # eq (2.36): coordinate update
+                     lam * alpha * wp[j] / den)
+
+    r <- r - Xw[, j] * beta[j]            # eq (2.38): update residuals
+  }
+  return(beta)
+}
+```
+
+## Ridge, LASSO, ENet
+
+```{r glmnet_estimators, include = TRUE}
+fit_ridge <- function(X, y) {
+  p <- ncol(X); if (sd(y)<1e-8) return(rep(0,p))
+  f <- tryCatch(cv.glmnet(X,y,alpha=0,nfolds=NFOLD,nlambda=NLAM),
+                error=function(e)NULL)
+  if (is.null(f)) return(rep(0,p))
+  safe_coef_vec(as.vector(coef(f,s="lambda.min"))[-1],p)
+}
+fit_lasso <- function(X, y) {
+  p <- ncol(X); if (sd(y)<1e-8) return(rep(0,p))
+  f <- tryCatch(cv.glmnet(X,y,alpha=1,nfolds=NFOLD,nlambda=NLAM),
+                error=function(e)NULL)
+  if (is.null(f)) return(rep(0,p))
+  safe_coef_vec(as.vector(coef(f,s="lambda.min"))[-1],p)
+}
+fit_enet <- function(X, y, al=0.5) {
+  p <- ncol(X); if (sd(y)<1e-8) return(rep(0,p))
+  f <- tryCatch(cv.glmnet(X,y,alpha=al,nfolds=NFOLD,nlambda=NLAM),
+                error=function(e)NULL)
+  if (is.null(f)) return(rep(0,p))
+  safe_coef_vec(as.vector(coef(f,s="lambda.min"))[-1],p)
+}
+```
+
+## MM-RWAL — equations (2.19) and (2.20)
+
+```{r mm_rwal}
+## MM-RWAL (Machkour et al., 2020; Toka et al., 2021)
+##
+## STEP 1:  MM-LASSO pilot  →  beta_hat_mm_lasso  (equations 2.19-2.20)
+##   p < n : lmrob (true MM) residuals → Tukey weights → weighted LASSO
+##   p >= n: Huber-IRLS proxy → Tukey weights → weighted LASSO
+##           (lmrob infeasible when p >= n)
+##
+## STEP 2:  Observation weights from MM-LASSO residuals
+##   w(r_i) = (1 - (r_i / (c * s_n))^2)^2  for |r_i/(c*s_n)| <= 1, else 0
+##
+## STEP 3:  z_j normalisation — equation (2.20)
+##   z_j = mean(w) * p / sum(mean(w)) ,  sum(z_j) = p
+##
+## STEP 4:  Adaptive weights — equation (2.20)
+##   w_j = 1 / (z_j * |beta_j_mm_lasso| + delta)
+##
+## STEP 5:  One cv.glmnet to select fixed lambda
+##
+## STEP 6:  IRLS loop with fixed lambda and adaptive weights
+fit_mm_rwal <- function(X, y, c_val=4.685, delta=1e-6,
+                         max_iter=3L, tol=1e-3) {
+  n <- nrow(X); p <- ncol(X)
+
+  ## ── STEP 1: MM-LASSO pilot ──────────────────────────────────────────────
+  beta_mm_lasso <- tryCatch({
+
+    if (p < n) {
+      ## True MM: lmrob residuals -> Tukey weights -> weighted LASSO
+      mm_fit <- suppressWarnings(
+        lmrob(y ~ X - 1, setting="KS2014", k.max=200, maxit.scale=200))
+      r_mm  <- residuals(mm_fit); s_mm <- mad(r_mm)
+      u_mm  <- r_mm / max(s_mm, 1e-10)
+      rw_mm <- ifelse(abs(u_mm)<=c_val, (1-(u_mm/c_val)^2)^2, 0)
+      Xw_mm <- sweep(X, 1, sqrt(rw_mm),"*"); yw_mm <- y*sqrt(rw_mm)
+      f0    <- cv.glmnet(Xw_mm, yw_mm, alpha=1, nfolds=NFOLD, nlambda=NLAM)
+      safe_coef_vec(as.vector(coef(f0, s="lambda.1se"))[-1], p)
+
+    } else {
+      ## p >= n: Huber-IRLS proxy (3 passes, c=1.345)
+      f0    <- cv.glmnet(X, y, alpha=1, nfolds=NFOLD, nlambda=NLAM)
+      b_h   <- safe_coef_vec(as.vector(coef(f0,s="lambda.1se"))[-1], p)
+      lam_h <- f0$lambda.1se
+      for (hs in seq_len(3)) {
+        r_h  <- as.vector(y - X %*% b_h)
+        s_h  <- mad(r_h); if (!is.finite(s_h)||s_h<1e-10) break
+        u_h  <- r_h/s_h; rw_h <- pmin(1, 1.345/abs(u_h))
+        rw_h[!is.finite(rw_h)] <- 1
+        Xw_h <- sweep(X,1,sqrt(rw_h),"*"); yw_h <- y*sqrt(rw_h)
+        fg_h <- tryCatch(
+          glmnet(Xw_h,yw_h,alpha=1,lambda=lam_h,standardize=FALSE),
+          error=function(e)NULL)
+        if (is.null(fg_h)) break
+        bn   <- as.vector(coef(fg_h))[-1]
+        if (length(bn)!=p||any(!is.finite(bn))) break
+        if (sqrt(sum((bn-b_h)^2))<1e-3){b_h<-bn;break}; b_h <- bn
+      }
+      ## Tukey weights from Huber-IRLS residuals
+      r_rob  <- as.vector(y - X %*% b_h)
+      s_rob  <- mad(r_rob); if (!is.finite(s_rob)||s_rob<1e-10) s_rob <- mad(y)
+      u_rob  <- r_rob/s_rob
+      rw_rob <- ifelse(abs(u_rob)<=c_val,(1-(u_rob/c_val)^2)^2,0)
+      Xw_rob <- sweep(X,1,sqrt(rw_rob),"*"); yw_rob <- y*sqrt(rw_rob)
+      f1     <- tryCatch(
+        cv.glmnet(Xw_rob,yw_rob,alpha=1,nfolds=NFOLD,nlambda=NLAM),
+        error=function(e)f0)
+      safe_coef_vec(as.vector(coef(f1,s="lambda.1se"))[-1], p)
+    }
+
+  }, error=function(e) rep(0,p))
+
+  ## ── STEP 2: observation weights from MM-LASSO residuals ─────────────────
+  r_p <- as.vector(y - X %*% beta_mm_lasso)
+  s_n <- mad(r_p); if (!is.finite(s_n)||s_n<1e-10) s_n <- 1
+  u_p <- r_p/s_n
+  ow  <- ifelse(abs(u_p)<=c_val, (1-(u_p/c_val)^2)^2, 0)
+  mw  <- mean(ow); if (mw<1e-12) mw <- 1
+
+  ## ── STEP 3: z_j normalisation — equation (2.20),  sum(z_j) = p ─────────
+  z_j <- rep(mw, p); z_j <- z_j * p / sum(z_j)
+
+  ## ── STEP 4: adaptive weights — equation (2.20) ──────────────────────────
+  ## w_j = 1 / (z_j * |beta_j_mm_lasso| + delta)
+  wp  <- 1 / (z_j * abs(beta_mm_lasso) + delta)
+  wp  <- pmin(wp, quantile(wp, 0.95)); wp <- wp/mean(wp)
+
+  ## ── STEP 5: one cv.glmnet with adaptive weights to fix lambda ───────────
+  pf  <- tryCatch(
+    cv.glmnet(X,y,alpha=1,penalty.factor=wp,nfolds=NFOLD,nlambda=NLAM),
+    error=function(e)NULL)
+  if (is.null(pf)) return(beta_mm_lasso)
+  lam  <- pf$lambda.1se
+  beta <- safe_coef_vec(as.vector(coef(pf,s="lambda.1se"))[-1],p)
+
+  ## ── STEP 6: IRLS loop — minimises equation (2.19) ───────────────────────
+  for (i in seq_len(max_iter)) {
+    r  <- as.vector(y - X %*% beta); sn <- mad(r)
+    if (!is.finite(sn)||sn<1e-10) break
+    u  <- r/sn; rw <- ifelse(abs(u)<=c_val,(1-(u/c_val)^2)^2,0)
+    if (sum(rw)<1e-6) break
+    Xw <- sweep(X,1,sqrt(rw),"*"); yw <- y*sqrt(rw)
+    if (!is.finite(sd(yw))||sd(yw)<1e-8) break
+    fg <- tryCatch(
+      glmnet(Xw,yw,alpha=1,lambda=lam,penalty.factor=wp,standardize=FALSE),
+      error=function(e)NULL)
+    if (is.null(fg)) break
+    bn <- as.vector(coef(fg))[-1]
+    if (length(bn)!=p||any(!is.finite(bn))) break
+    if (sum((bn-beta)^2)<tol^2){beta<-bn;break}; beta <- bn
+  }
+  return(beta)
+}
+```
+
+## RAENR-MM — equations (2.22) and (2.34)–(2.39)
+
+```{r raenr_mm, include = TRUE}
+## RAENR-MM (Alabi & Oyeyemi, 2025)
+## Main novelty: adaptive weights from MM initial pilot, not from EN pilot.
+##
+## STEP 1: EN pilot       -> fixed lambda,  seed beta_0
+## STEP 2: MM pilot       -> beta_hat_mm  for adaptive weights  (eq 2.22)
+##   p < n  : lmrob  (true MM estimator)
+##   p >= n : Huber-IRLS proxy  (lmrob infeasible)
+## STEP 3: Adaptive weights  w_j^{(a)} = 1/(|beta_j_mm|^gamma + delta)  (eq 2.22)
+##   NOTE: wp is computed ONCE from the MM pilot and stays FIXED for ALL
+##         IRLS iterations. Only the observation weights w_i^{(r)} change.
+## STEP 4: Outer IRLS + Inner CD loop
+##   IRLS (outer, eq 2.23): recomputes Tukey observation weights each pass
+##   CD   (inner, eq 2.34-2.38): cycles through all p predictors per pass
+##   Convergence (eq 2.39): ||beta_new - beta_old|| < tol for both loops
+fit_raen_mm <- function(X, y, gamma    = 2,
+                               c_val   = 4.685,
+                               delta   = 1e-6,
+                               al      = 0.2,
+                               max_irls = MAX_IRLS,
+                               max_cd   = MAX_CD,
+                               tol_irls = TOL_IRLS,
+                               tol_cd   = TOL_CD) {
+  n <- nrow(X); p <- ncol(X)
+  if (!is.finite(sd(y))||sd(y)<1e-8) return(rep(0,p))
+
+  ## ── STEP 1: EN pilot — selects lambda, seeds IRLS starting point ────────
+  pilot_en <- tryCatch(
+    cv.glmnet(X, y, alpha=al, nfolds=NFOLD, nlambda=NLAM),
+    error=function(e)NULL)
+  if (is.null(pilot_en)) return(rep(0,p))
+  lambda_fixed <- pilot_en$lambda.1se
+  beta         <- safe_coef_vec(as.vector(coef(pilot_en,s="lambda.1se"))[-1],p)
+
+  ## ── STEP 2: MM pilot — beta_hat_mm for adaptive weights  eq (2.22) ──────
+  ## This is the MAIN NOVELTY: adaptive weights must come from the MM
+  ## initial estimator, not from the EN pilot. Using EN here would cause
+  ## outlier-inflated coefficients to receive spuriously small penalties,
+  ## defeating the purpose of the adaptive weighting.
+  beta_mm <- tryCatch({
+
+    if (p < n) {
+      ## True MM estimator (50% breakdown point)
+      mm_fit <- suppressWarnings(
+        lmrob(y ~ X - 1, setting="KS2014", k.max=200, maxit.scale=200))
+      out <- as.vector(coef(mm_fit))
+      if (length(out)!=p||any(!is.finite(out))) rep(0,p) else out
+
+    } else {
+      ## Huber-IRLS proxy for p >= n (3 passes, Huber c=1.345)
+      b_h   <- beta; lam_h <- lambda_fixed
+      for (hs in seq_len(3)) {
+        r_h  <- as.vector(y - X %*% b_h)
+        s_h  <- mad(r_h); if (!is.finite(s_h)||s_h<1e-10) break
+        u_h  <- r_h/s_h; rw_h <- pmin(1, 1.345/abs(u_h))
+        rw_h[!is.finite(rw_h)] <- 1
+        Xw_h <- sweep(X,1,sqrt(rw_h),"*"); yw_h <- y*sqrt(rw_h)
+        fg_h <- tryCatch(
+          glmnet(Xw_h,yw_h,alpha=al,lambda=lam_h,standardize=FALSE),
+          error=function(e)NULL)
+        if (is.null(fg_h)) break
+        bn_h <- as.vector(coef(fg_h))[-1]
+        if (length(bn_h)!=p||any(!is.finite(bn_h))) break
+        if (sqrt(sum((bn_h-b_h)^2))<1e-3){b_h<-bn_h;break}; b_h <- bn_h
+      }
+      b_h
+    }
+
+  }, error=function(e) beta)   # fall back to EN pilot only if MM crashes
+
+  ## ── STEP 3: Adaptive penalty weights — equation (2.22) ──────────────────
+  ## w_j^{(a)} = 1 / ( |beta_j_mm|^gamma + delta )
+  ## Large |beta_j_mm| -> small w_j -> weak penalty -> predictor survives
+  ## Small |beta_j_mm| -> large w_j -> strong penalty -> predictor shrinks to 0
+  ## wp is computed ONCE here and is NOT updated inside the IRLS loop.
+  wp <- 1 / (abs(beta_mm)^gamma + delta)   # equation (2.22)
+  wp <- pmin(wp, quantile(wp, 0.95))       # winsorise extreme weights
+  wp <- wp / mean(wp)                      # rescale: mean(wp) = 1
+
+  ## ── STEP 4: Outer IRLS + Inner CD — equations (2.23), (2.34)–(2.39) ────
+  ##
+  ## Outer IRLS loop:
+  ##   - Compute Tukey biweight observation weights w_i^{(r)}  (eq 2.23)
+  ##   - Form weighted matrices Xw = diag(sqrt(rw)) X, yw = sqrt(rw) y
+  ##   - Run inner CD loop to convergence
+  ##   - Check outer convergence on ||beta_new - beta_old||  (eq 2.39)
+  ##
+  ## Inner CD loop:
+  ##   - Each call to cd_sweep cycles through ALL p predictors once
+  ##   - Implements equations (2.34)-(2.38) exactly
+  ##   - Check inner convergence on ||beta_new - beta_old||  (eq 2.39)
+  ##
+  ## The inner problem solved each IRLS step is:
+  ##   min_beta  ||yw - Xw beta||^2
+  ##             + lambda [ alpha  sum_j w_j^{(a)} |beta_j|
+  ##                      + (1-alpha) sum_j beta_j^2 ]
+  ## with FIXED Xw, yw (current IRLS weights), FIXED lambda, FIXED wp.
+  for (irls in seq_len(max_irls)) {
+
+    ## eq (2.23): Tukey biweight observation weights
+    r         <- as.vector(y - X %*% beta)
+    sigma_hat <- mad(r)
+    if (!is.finite(sigma_hat)||sigma_hat<1e-10) break
+
+    u  <- r / sigma_hat
+    rw <- ifelse(abs(u)<=c_val, (1-(u/c_val)^2)^2, 0)   # eq (2.23)
+    if (sum(rw)<1e-6) break
+
+    Xw <- sweep(X, 1, sqrt(rw),"*")         # Xw_ij = sqrt(w_i^{(r)}) * x_ij
+    yw <- y * sqrt(rw)                       # yw_i  = sqrt(w_i^{(r)}) * y_i
+    if (!is.finite(sd(yw))||sd(yw)<1e-8) break
+
+    beta_pre_cd <- beta                      # save for outer convergence check
+
+    ## Inner CD loop — equations (2.34)-(2.38)
+    for (cd_iter in seq_len(max_cd)) {
+      beta_old <- beta
+      beta     <- cd_sweep(Xw, yw, beta, wp, lambda_fixed, al)
+
+      ## Inner convergence — equation (2.39)
+      if (sqrt(sum((beta-beta_old)^2)) < tol_cd) break
+    }
+
+    ## Outer convergence — equation (2.39)
+    if (sqrt(sum((beta-beta_pre_cd)^2)) < tol_irls) break
+  }
+
+  return(beta)
+}
+```
+
+# Part C — Performance Metrics and Run Functions
+
+```{r metrics, include = TRUE}
+perf_metrics <- function(yt, yp) {
+  ss_r <- sum((yt-yp)^2); ss_t <- sum((yt-mean(yt))^2)
+  c(RMSE=sqrt(mean((yt-yp)^2)),
+    MAE =mean(abs(yt-yp)),
+    R2  =if(ss_t<1e-12) NA_real_ else 1-ss_r/ss_t)
+}
+jaccard <- function(A,B) {
+  u <- union(A,B); if (!length(u)) return(0)
+  length(intersect(A,B))/length(u)
+}
+```
+
+```{r run_fns, include = TRUE}
+## THCM run: train on ALL samples (including rowwise outliers),
+##           test restricted to CLEAN samples only (not flagged by MCD-RMD)
+run_thcm <- function(rep_id, Xp, y, thcm_rows, env) {
+  set.seed(50000 + rep_id)
+  n        <- nrow(Xp)
+  clean_ix <- setdiff(seq_len(n), thcm_rows)
+  if (length(clean_ix) < 5) return(NULL)
+  n_te <- max(2L, floor((1-train_prop)*length(clean_ix)))
+  te   <- sort(sample(clean_ix, n_te))
+  tr   <- setdiff(seq_len(n), te)
+  Xtr  <- Xp[tr,]; Xte <- Xp[te,]
+  ytr  <- y[tr];   yte <- y[te]; mu <- mean(ytr)
+
+  b_r  <- fit_ridge(Xtr, ytr)
+  b_l  <- fit_lasso(Xtr, ytr)
+  b_e  <- fit_enet(Xtr,  ytr, al=env$alpha_en)
+  b_rw <- fit_mm_rwal(Xtr, ytr, c_val=env$c_val, delta=env$delta)
+  b_rm <- fit_raen_mm(Xtr, ytr, gamma=env$gamma_raen, al=env$alpha_raen,
+                       c_val=env$c_val, delta=env$delta)
+
+  mk <- function(m, yp) {
+    pm <- perf_metrics(yte, yp)
+    bv <- switch(m,Ridge=b_r,LASSO=b_l,ENET=b_e,`MM-RWAL`=b_rw,`RAENR-MM`=b_rm)
+    data.frame(Rep=rep_id,Method=m,RMSE=pm["RMSE"],MAE=pm["MAE"],R2=pm["R2"],
+               Selected=sum(bv!=0),row.names=NULL)
+  }
+  rbind(mk("Ridge",    mu+as.vector(Xte%*%b_r)),
+        mk("LASSO",    mu+as.vector(Xte%*%b_l)),
+        mk("ENET",     mu+as.vector(Xte%*%b_e)),
+        mk("MM-RWAL",  mu+as.vector(Xte%*%b_rw)),
+        mk("RAENR-MM", mu+as.vector(Xte%*%b_rm)))
+}
+
+## ICM run: train on FULL matrix (with cellwise outliers),
+##          test on same hold-out with outlier cells median-imputed
+run_icm <- function(rep_id, Xp, Xp_clean, y, env) {
+  set.seed(60000 + rep_id)
+  n  <- nrow(Xp)
+  tr <- sample(seq_len(n), floor(train_prop*n))
+  te <- setdiff(seq_len(n), tr)
+  Xtr        <- Xp[tr,]
+  Xte_clean  <- Xp_clean[te,]
+  ytr <- y[tr]; yte <- y[te]; mu <- mean(ytr)
+
+  b_r  <- fit_ridge(Xtr, ytr)
+  b_l  <- fit_lasso(Xtr, ytr)
+  b_e  <- fit_enet(Xtr,  ytr, al=env$alpha_en)
+  b_rw <- fit_mm_rwal(Xtr, ytr, c_val=env$c_val, delta=env$delta)
+  b_rm <- fit_raen_mm(Xtr, ytr, gamma=env$gamma_raen, al=env$alpha_raen,
+                       c_val=env$c_val, delta=env$delta)
+
+  mk <- function(m, yp) {
+    pm <- perf_metrics(yte, yp)
+    bv <- switch(m,Ridge=b_r,LASSO=b_l,ENET=b_e,`MM-RWAL`=b_rw,`RAENR-MM`=b_rm)
+    data.frame(Rep=rep_id,Method=m,RMSE=pm["RMSE"],MAE=pm["MAE"],R2=pm["R2"],
+               Selected=sum(bv!=0),row.names=NULL)
+  }
+  rbind(mk("Ridge",    mu+as.vector(Xte_clean%*%b_r)),
+        mk("LASSO",    mu+as.vector(Xte_clean%*%b_l)),
+        mk("ENET",     mu+as.vector(Xte_clean%*%b_e)),
+        mk("MM-RWAL",  mu+as.vector(Xte_clean%*%b_rw)),
+        mk("RAENR-MM", mu+as.vector(Xte_clean%*%b_rm)))
+}
+```
+
+# Part D — ICM Clean Matrix Builder
+
+```{r build_icm_clean, include = TRUE}
+## Replace outlier cells (|z| > 3) with column medians
+build_icm_clean <- function(Xp) {
+  cm  <- apply(Xp, 2, median, na.rm=TRUE)
+  csd <- pmax(apply(Xp, 2, mad, na.rm=TRUE)*1.4826, 1e-8)
+  Z   <- sweep(sweep(Xp, 2, cm,"-"), 2, csd,"/")
+  Xc  <- Xp
+  for (j in seq_len(ncol(Xp))) {
+    bad       <- abs(Z[,j]) > 3
+    Xc[bad,j] <- cm[j]
+  }
+  Xc
+}
+```
+
+# Part E — Parallel Runs (future_apply for speed)
+
+```{r parallel_setup, include = TRUE}
+## ── Parallel setup using future / future.apply ───────────────────────────
+## future_lapply is ~20% faster than foreach for this workload because:
+##  (1) no per-iteration overhead of the foreach combiner
+##  (2) future automatically chunks tasks across workers
+##  (3) future.seed handles RNG without additional overhead
+n_workers <- max(1L, min(6L, parallel::detectCores()-2L))
+plan(multisession, workers=n_workers)
+options(future.globals.maxSize=4*1024^3)
+cat("Workers:", n_workers, "\n")
+
+## Pack tuning constants into a list for export to workers
+ENV <- list(gamma_raen=gamma_raen, alpha_en=alpha_en,
+            alpha_raen=alpha_raen, c_val=c_val, delta=delta,
+            NLAM=NLAM, NFOLD=NFOLD, MAX_IRLS=MAX_IRLS,
+            MAX_CD=MAX_CD, TOL_IRLS=TOL_IRLS, TOL_CD=TOL_CD,
+            train_prop=train_prop)
+
+## All functions that workers need
+WORKER_FUNS <- c("safe_coef_vec","soft_threshold","cd_sweep",
+                 "fit_ridge","fit_lasso","fit_enet",
+                 "fit_mm_rwal","fit_raen_mm",
+                 "perf_metrics","run_thcm","run_icm",
+                 "build_icm_clean","NLAM","NFOLD",
+                 "MAX_IRLS","MAX_CD","TOL_IRLS","TOL_CD","train_prop")
+```
+
+```{r full_run, cache=TRUE, include = TRUE}
+thcm_res_list <- list()
+icm_res_list  <- list()
+
+for (pp in P_GRID) {
+  cat("\n── p =", pp, "──────────────────────────────────────────\n")
+  Xp       <- X_all[, seq_len(pp)]
+  Xp_clean <- build_icm_clean(Xp)          # computed ONCE per p level
+  d_tmp    <- diag_list[[which(P_GRID==pp)]]
+  th_rows  <- d_tmp$thcm_flagged
+
+  cat("  THCM-flagged samples:", length(th_rows),
+      "| ICM clean matrix built\n")
+
+  ## ── THCM runs ──────────────────────────────────────────────────────────
+  cat("  Running THCM (", n_reps, "reps) ...\n")
+  t0 <- proc.time()
+  t_res <- future_lapply(
+    seq_len(n_reps),
+    function(r) run_thcm(r, Xp, y_full, th_rows, ENV),
+    future.seed      = TRUE,
+    future.globals   = c(WORKER_FUNS, "ENV", "Xp", "y_full", "th_rows"),
+    future.packages  = c("glmnet","robustbase"),
+    future.chunk.size = ceiling(n_reps / (n_workers * 2))
+  )
+  elapsed <- round((proc.time()-t0)["elapsed"]/60, 1)
+  t_df    <- dplyr::bind_rows(Filter(Negate(is.null), t_res))
+  if (nrow(t_df)>0)
+    thcm_res_list[[as.character(pp)]] <- dplyr::mutate(t_df, p=pp)
+  cat("  THCM done in", elapsed, "min |", nrow(t_df), "rows\n")
+
+  ## ── ICM runs ───────────────────────────────────────────────────────────
+  cat("  Running ICM  (", n_reps, "reps) ...\n")
+  t0 <- proc.time()
+  i_res <- future_lapply(
+    seq_len(n_reps),
+    function(r) run_icm(r, Xp, Xp_clean, y_full, ENV),
+    future.seed      = TRUE,
+    future.globals   = c(WORKER_FUNS, "ENV", "Xp", "Xp_clean", "y_full"),
+    future.packages  = c("glmnet","robustbase"),
+    future.chunk.size = ceiling(n_reps / (n_workers * 2))
+  )
+  elapsed <- round((proc.time()-t0)["elapsed"]/60, 1)
+  i_df    <- dplyr::bind_rows(Filter(Negate(is.null), i_res))
+  if (nrow(i_df)>0)
+    icm_res_list[[as.character(pp)]] <- dplyr::mutate(i_df, p=pp)
+  cat("  ICM  done in", elapsed, "min |", nrow(i_df), "rows\n")
+}
+
+plan(sequential)   # release workers
+
+thcm_raw <- dplyr::bind_rows(thcm_res_list)
+icm_raw  <- dplyr::bind_rows(icm_res_list)
+saveRDS(list(thcm=thcm_raw, icm=icm_raw), "GSE14520_real_results.rds")
+cat("\nTHCM rows:", nrow(thcm_raw), "| ICM rows:", nrow(icm_raw), "\n")
+```
+
+# Part F — Aggregate Results
+
+```{r aggregate, include = TRUE}
+summarise_raw <- function(df) {
+  df |>
+    dplyr::group_by(Method, p) |>
+    dplyr::summarise(
+      Mean_RMSE     = round(mean(RMSE,     na.rm=TRUE), 5),
+      SD_RMSE       = round(sd(RMSE,       na.rm=TRUE), 5),
+      Median_RMSE   = round(median(RMSE,   na.rm=TRUE), 5),
+      Mean_MAE      = round(mean(MAE,      na.rm=TRUE), 5),
+      Mean_R2       = round(mean(R2,       na.rm=TRUE), 4),
+      SD_R2         = round(sd(R2,         na.rm=TRUE), 4),
+      Mean_Selected = round(mean(Selected, na.rm=TRUE), 1),
+      SD_Selected   = round(sd(Selected,   na.rm=TRUE), 1),
+      n_reps_actual = dplyr::n() / length(METHODS),
+      .groups="drop") |>
+    dplyr::arrange(p, Mean_RMSE)
+}
+
+thcm_sum <- summarise_raw(thcm_raw)
+icm_sum  <- summarise_raw(icm_raw)
+
+kable(thcm_sum |> dplyr::filter(p==5000) |> dplyr::select(-SD_RMSE,-SD_R2),
+      caption="Table 4: THCM Performance (p=5,000)",
+      booktabs=TRUE, align="c", digits=4) |>
+  kable_styling(bootstrap_options=c("striped","hover"), full_width=FALSE) |>
+  row_spec(which(thcm_sum[thcm_sum$p==5000,"Method"]=="RAENR-MM"),
+           bold=TRUE, background="#EBF5FB")
+
+kable(icm_sum |> dplyr::filter(p==5000) |> dplyr::select(-SD_RMSE,-SD_R2),
+      caption="Table 5: ICM Performance (p=5,000)",
+      booktabs=TRUE, align="c", digits=4) |>
+  kable_styling(bootstrap_options=c("striped","hover"), full_width=FALSE) |>
+  row_spec(which(icm_sum[icm_sum$p==5000,"Method"]=="RAENR-MM"),
+           bold=TRUE, background="#EBF5FB")
+```
+
+# Part G — Excel Workbook
+
+```{r excel, include = TRUE}
+wb  <- createWorkbook()
+hs  <- createStyle(fontColour="#FFFFFF",bgFill="#21295C",
+                    textDecoration="Bold",halign="CENTER")
+hi  <- createStyle(bgFill="#EBF5FB",textDecoration="Bold")
+
+add_ws <- function(wb,name,df,hi_m="RAENR-MM") {
+  addWorksheet(wb,name)
+  writeData(wb,name,df,headerStyle=hs)
+  if (!is.na(hi_m)&&"Method"%in%colnames(df)) {
+    ri <- which(df$Method==hi_m)+1L
+    if (length(ri)) addStyle(wb,name,hi,rows=ri,
+                              cols=seq_len(ncol(df)),gridExpand=TRUE)
+  }
+  for (ci in seq_len(ncol(df)))
+    setColWidths(wb,name,cols=ci,widths=max(nchar(colnames(df)[ci])+3,13))
+  freezePane(wb,name,firstRow=TRUE)
+}
+
+add_ws(wb,"THCM_Performance",  thcm_sum)
+add_ws(wb,"ICM_Performance",   icm_sum)
+add_ws(wb,"THCM_Best",
+       thcm_sum|>dplyr::group_by(p)|>dplyr::slice_min(Mean_RMSE,n=1)|>dplyr::ungroup())
+add_ws(wb,"ICM_Best",
+       icm_sum |>dplyr::group_by(p)|>dplyr::slice_min(Mean_RMSE,n=1)|>dplyr::ungroup())
+
+ss <- thcm_sum|>dplyr::filter(Method=="RAENR-MM")|>
+  dplyr::select(p,THCM_RMSE=Mean_RMSE,THCM_R2=Mean_R2)|>
+  dplyr::inner_join(
+    icm_sum|>dplyr::filter(Method=="RAENR-MM")|>
+      dplyr::select(p,ICM_RMSE=Mean_RMSE,ICM_R2=Mean_R2),by="p")|>
+  dplyr::mutate(Diff_ICM_minus_THCM=round(ICM_RMSE-THCM_RMSE,5))
+add_ws(wb,"RAENRMM_THCM_vs_ICM",ss,hi_m=NA)
+
+impr <- thcm_sum|>dplyr::filter(Method=="RAENR-MM")|>
+  dplyr::select(p,RAEN_THCM=Mean_RMSE)|>
+  dplyr::inner_join(thcm_sum|>dplyr::filter(Method=="MM-RWAL")|>
+    dplyr::select(p,RWAL_THCM=Mean_RMSE),by="p")|>
+  dplyr::inner_join(icm_sum|>dplyr::filter(Method=="RAENR-MM")|>
+    dplyr::select(p,RAEN_ICM=Mean_RMSE),by="p")|>
+  dplyr::inner_join(icm_sum|>dplyr::filter(Method=="MM-RWAL")|>
+    dplyr::select(p,RWAL_ICM=Mean_RMSE),by="p")|>
+  dplyr::mutate(
+    Pct_Impr_THCM=round((RWAL_THCM-RAEN_THCM)/RWAL_THCM*100,2),
+    Pct_Impr_ICM =round((RWAL_ICM -RAEN_ICM)/RWAL_ICM*100,2))
+add_ws(wb,"RAENRMM_vs_MMRWAL",impr,hi_m=NA)
+
+add_ws(wb,"Multicollinearity",mc_df,  hi_m=NA)
+add_ws(wb,"ICM_Diagnostics",  icm_df, hi_m=NA)
+add_ws(wb,"THCM_Diagnostics", thcm_df,hi_m=NA)
+
+both_sel <- dplyr::bind_rows(
+  thcm_sum|>dplyr::select(Method,p,Mean_Selected,SD_Selected)|>
+    dplyr::mutate(Framework="THCM"),
+  icm_sum |>dplyr::select(Method,p,Mean_Selected,SD_Selected)|>
+    dplyr::mutate(Framework="ICM"))
+add_ws(wb,"Selection_Sizes",both_sel)
+
+saveWorkbook(wb,"GSE14520_Real_Results.xlsx",overwrite=TRUE)
+cat("Excel saved: GSE14520_Real_Results.xlsx\n")
+```
+
+# Part H — Publication Figures
+
+```{r plot_theme, include = TRUE}
+tt <- function() {
+  theme_bw(base_size=11)+
+  theme(legend.position="bottom",legend.title=element_text(face="bold"),
+        panel.grid.minor=element_blank(),
+        plot.title=element_text(face="bold",size=12),
+        plot.subtitle=element_text(colour="grey40",size=10),
+        axis.title=element_text(face="bold"),
+        strip.background=element_rect(fill="#21295C"),
+        strip.text=element_text(colour="white",face="bold"))
+}
+msc <- scale_colour_manual(values=COLS,breaks=METHODS,name="Estimator")
+msf <- scale_fill_manual(values=COLS,breaks=METHODS,name="Estimator")
+sv  <- function(g,nm,w=10,h=6)
+  ggsave(paste0("figures/",nm),g,width=w,height=h,dpi=200,bg="white")
+PL  <- setNames(paste0("p=",P_GRID/1000,"k"),P_GRID)
+both_sum <- dplyr::bind_rows(
+  thcm_sum|>dplyr::mutate(Framework="THCM"),
+  icm_sum |>dplyr::mutate(Framework="ICM")) |>
+  dplyr::mutate(Method=factor(Method,levels=METHODS),
+                p_lab=PL[as.character(p)])
+```
+
+```{r figures_loop, include = TRUE}
+## Separate RMSE bar chart per p per framework (10 individual charts)
+for (pp in P_GRID) {
+  for (fw in c("THCM","ICM")) {
+    sub <- both_sum|>dplyr::filter(p==pp,Framework==fw)
+    g   <- ggplot(sub,aes(x=Method,y=Mean_RMSE,fill=Method))+
+      geom_col(width=0.65,alpha=0.9)+
+      geom_errorbar(aes(ymin=Mean_RMSE-SD_RMSE,ymax=Mean_RMSE+SD_RMSE),
+                    width=0.25)+
+      geom_text(aes(label=round(Mean_RMSE,4)),vjust=-0.6,
+                fontface="bold",size=3.2)+
+      msf+tt()+theme(legend.position="none",
+                     axis.text.x=element_text(angle=20,hjust=1))+
+      labs(title=paste0(fw,": RMSE | p=",format(pp,big.mark=",")),
+           subtitle="GSE14520 | AFP",x=NULL,y="Mean RMSE ± SD")
+    print(g); sv(g,paste0("Fig_",fw,"_RMSE_p",pp,".png"),w=8,h=5)
+  }
+}
+
+## Separate R² bar chart per p per framework
+for (pp in P_GRID) {
+  for (fw in c("THCM","ICM")) {
+    sub <- both_sum|>dplyr::filter(p==pp,Framework==fw)
+    g   <- ggplot(sub,aes(x=Method,y=Mean_R2,fill=Method))+
+      geom_col(width=0.65,alpha=0.9)+
+      geom_errorbar(aes(ymin=Mean_R2-SD_R2,ymax=Mean_R2+SD_R2),width=0.25)+
+      geom_text(aes(label=round(Mean_R2,4)),vjust=-0.6,
+                fontface="bold",size=3.2)+
+      msf+tt()+theme(legend.position="none",
+                     axis.text.x=element_text(angle=20,hjust=1))+
+      labs(title=paste0(fw,": R² | p=",format(pp,big.mark=",")),
+           x=NULL,y=expression(Mean~R^2~"± SD"))
+    print(g); sv(g,paste0("Fig_",fw,"_R2_p",pp,".png"),w=8,h=5)
+  }
+}
+
+## Genes selected — sparse methods only, per p per framework
+for (pp in P_GRID) {
+  for (fw in c("THCM","ICM")) {
+    sub <- both_sum|>dplyr::filter(p==pp,Framework==fw,Method!="Ridge")
+    g   <- ggplot(sub,aes(x=Method,y=Mean_Selected,fill=Method))+
+      geom_col(width=0.65,alpha=0.9)+
+      geom_errorbar(aes(ymin=pmax(Mean_Selected-SD_Selected,0),
+                        ymax=Mean_Selected+SD_Selected),width=0.25)+
+      geom_text(aes(label=round(Mean_Selected,1)),vjust=-0.6,
+                fontface="bold",size=3.2)+
+      msf+tt()+theme(legend.position="none",
+                     axis.text.x=element_text(angle=20,hjust=1))+
+      labs(title=paste0(fw,": Genes Selected | p=",format(pp,big.mark=",")),
+           subtitle="Ridge excluded",x=NULL,y="Mean genes ± SD")
+    print(g); sv(g,paste0("Fig_",fw,"_Selected_p",pp,".png"),w=8,h=5)
+  }
+}
+
+## RMSE trend across p (one per framework)
+for (fw in c("THCM","ICM")) {
+  sub <- both_sum|>dplyr::filter(Framework==fw)
+  g   <- ggplot(sub,aes(x=p/1000,y=Mean_RMSE,colour=Method,group=Method))+
+    geom_line(linewidth=1.1)+geom_point(size=3)+
+    geom_ribbon(aes(ymin=Mean_RMSE-SD_RMSE,ymax=Mean_RMSE+SD_RMSE,
+                    fill=Method),alpha=0.08,colour=NA)+
+    scale_fill_manual(values=COLS,breaks=METHODS,name="Estimator")+
+    msc+tt()+
+    scale_x_continuous(breaks=P_GRID/1000,labels=paste0(P_GRID/1000,"k"))+
+    labs(title=paste0(fw,": RMSE Trend across Dimensionality — GSE14520"),
+         subtitle="AFP response | Shaded = ± 1 SD",
+         x="p (thousands)",y="Mean RMSE")
+  print(g); sv(g,paste0("Fig_",fw,"_RMSE_Trend.png"))
+}
+
+## THCM vs ICM direct comparison per p (RAENR-MM only)
+for (pp in P_GRID) {
+  sub <- both_sum|>dplyr::filter(p==pp,Method=="RAENR-MM")
+  g   <- ggplot(sub,aes(x=Framework,y=Mean_RMSE,fill=Framework))+
+    geom_col(width=0.5,alpha=0.9)+
+    geom_errorbar(aes(ymin=Mean_RMSE-SD_RMSE,ymax=Mean_RMSE+SD_RMSE),
+                  width=0.2)+
+    geom_text(aes(label=round(Mean_RMSE,4)),vjust=-0.5,
+              fontface="bold",size=4)+
+    scale_fill_manual(values=c(THCM="#21295C",ICM="#E9A23B"),guide="none")+
+    tt()+labs(title=paste0("RAENR-MM: THCM vs ICM | p=",format(pp,big.mark=",")),
+              x=NULL,y="Mean RMSE ± SD")
+  print(g); sv(g,paste0("Fig_RAENRMM_THCM_ICM_p",pp,".png"),w=6,h=5)
+}
+
+## Multi-metric radar — sparse methods, per p per framework
+make_radar <- function(sum_df, fw_label, pp) {
+  sub <- sum_df|>dplyr::filter(p==pp,Method%in%SPARSE)
+  rmx <- max(sub$Mean_RMSE); rmi <- min(sub$Mean_RMSE)
+  mmx <- max(sub$Mean_MAE);  mmi <- min(sub$Mean_MAE)
+  sub <- sub|>dplyr::mutate(
+    RMSE_s=1-(Mean_RMSE-rmi)/(rmx-rmi+1e-9),
+    MAE_s =1-(Mean_MAE -mmi)/(mmx-mmi+1e-9),
+    R2_s  =pmax(Mean_R2,0),
+    Sel_s =1-(Mean_Selected-min(Mean_Selected))/(max(Mean_Selected)-min(Mean_Selected)+1e-9))
+  axes   <- c("1-RMSE","1-MAE","R²","Sparsity")
+  N      <- length(axes)
+  angles <- seq(0, 2*pi, length.out=N+1)[-(N+1)]
+  p_df   <- sub|>dplyr::select(Method,RMSE_s,MAE_s,R2_s,Sel_s)
+
+  ggplot()+
+    {lapply(c(.25,.5,.75,1),function(r){
+      d=data.frame(x=r*cos(angles),y=r*sin(angles));d=rbind(d,d[1,])
+      annotate("path",x=d$x,y=d$y,colour="grey80",linewidth=0.35)})
+    }+
+    {lapply(seq_len(N),function(i) list(
+      annotate("segment",x=0,y=0,xend=cos(angles[i]),yend=sin(angles[i]),
+               colour="grey70",linewidth=0.4),
+      annotate("text",x=1.2*cos(angles[i]),y=1.2*sin(angles[i]),
+               label=axes[i],size=3.5,fontface="bold")))
+    }+
+    {lapply(SPARSE, function(m) {
+      r <- p_df[p_df$Method==m,,drop=FALSE]
+      if (!nrow(r)) return(NULL)
+      v <- c(r$RMSE_s,r$MAE_s,r$R2_s,r$Sel_s)
+      d <- data.frame(x=v*cos(angles),y=v*sin(angles)); d <- rbind(d,d[1,])
+      list(annotate("polygon",x=d$x,y=d$y,fill=COLS[m],alpha=0.12,colour=NA),
+           annotate("path",x=d$x,y=d$y,colour=COLS[m],linewidth=1.4))
+    })}+
+    {lapply(c(.25,.5,.75,1),function(r)
+      annotate("text",x=0,y=r+0.05,label=r,size=2.5,colour="grey60"))}+
+    {data.frame(x=cos(angles)*.15,y=sin(angles)*.15,lab=axes) |>
+     (\(.) annotate("text",x=0,y=0,label=""))()}+
+    coord_fixed(xlim=c(-1.4,1.4),ylim=c(-1.4,1.4))+
+    theme_void()+
+    theme(plot.title=element_text(face="bold",hjust=0.5,size=12),
+          plot.subtitle=element_text(hjust=0.5,size=10,colour="grey40"),
+          legend.position="bottom")+
+    labs(title=paste0(fw_label," Radar | p=",format(pp,big.mark=",")),
+         subtitle="GSE14520 | AFP | Higher area = better overall")+
+    scale_colour_manual(values=COLS[SPARSE],breaks=SPARSE,name="Estimator")+
+    geom_point(data=data.frame(
+      x=c(-1.2,-.4,.4,1.2),y=rep(-1.35,4),m=SPARSE),
+      aes(x=x,y=y,colour=m),size=3)+
+    geom_text(data=data.frame(
+      x=c(-1.2,-.4,.4,1.2),y=rep(-1.45,4),m=SPARSE),
+      aes(x=x,y=y,label=m),size=2.8,fontface="bold")
+}
+
+for (pp in P_GRID) {
+  for (fw in c("THCM","ICM")) {
+    df <- if (fw=="THCM") thcm_sum else icm_sum
+    g  <- make_radar(df, fw, pp)
+    print(g); sv(g, paste0("Fig_Radar_",fw,"_p",pp,".png"),w=7,h=7)
+  }
+}
+```
+
+```{r session_info}
+figs <- sort(list.files("figures",pattern="\\.png$"))
+cat("Figures saved:", length(figs), "\n")
+cat(paste0("  ",figs,"\n"))
+sessionInfo()
+```
